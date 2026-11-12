@@ -1,0 +1,41 @@
+name: ACI Calendar Auto Sync
+
+on:
+  schedule:
+    # 30분마다 자동 실행
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # 내가 원할 때 수동으로 즉시 실행하는 버튼 생성
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 서버 방 파일 불러오기
+        uses: actions/checkout@v4
+
+      - name: 2. 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 3. 필요한 도구 및 브라우저 설치
+        run: |
+          pip install playwright requests icalendar
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: 4. 캘린더 연동 로봇 실행
+        run: python sync.py
+
+      - name: 5. 등록 완료한 일정 수첩(synced_events.txt) 저장
+        run: |
+          git config --global user.name "AutoSyncBot"
+          git config --global user.email "bot@example.com"
+          if [ -f synced_events.txt ]; then
+            git add synced_events.txt
+            git diff --staged --quiet || git commit -m "Update synced events"
+            git push
+          fi
