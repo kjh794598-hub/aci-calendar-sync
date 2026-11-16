@@ -24,26 +24,18 @@ def encode_imap_utf7(s):
     for ch in s:
         if 0x20 <= ord(ch) <= 0x7E:
             if b64_buf:
-                utf16 = "".join(b64_buf).encode("utf-16-be")
-                b64 = (
-                    base64.b64encode(utf16)
-                    .decode("ascii")
-                    .rstrip("=")
-                    .replace("/", ",")
-                )
+                raw = "".join(b64_buf).encode("utf-16-be")
+                b64 = base64.b64encode(raw).decode("ascii")
+                b64 = b64.rstrip("=").replace("/", ",")
                 res.append("&" + b64 + "-")
                 b64_buf = []
             res.append("&-" if ch == "&" else ch)
         else:
             b64_buf.append(ch)
     if b64_buf:
-        utf16 = "".join(b64_buf).encode("utf-16-be")
-        b64 = (
-            base64.b64encode(utf16)
-            .decode("ascii")
-            .rstrip("=")
-            .replace("/", ",")
-        )
+        raw = "".join(b64_buf).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode("ascii")
+        b64 = b64.rstrip("=").replace("/", ",")
         res.append("&" + b64 + "-")
     return "".join(res)
 
@@ -51,9 +43,87 @@ def encode_imap_utf7(s):
 def load_synced_ids():
     if not os.path.exists(SYNC_LOG_FILE):
         return set()
-    with open(SYNC_LOG_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
+    f = open(SYNC_LOG_FILE, "r", encoding="utf-8")
+    data = set(line.strip() for line in f if line.strip())
+    f.close()
+    return data
 
 
 def save_synced_id(msg_id):
-    with open(SYNC_LOG_FILE, "a", encoding="utf-8")
+    f = open(SYNC_LOG_FILE, "a", encoding="utf-8")
+    f.write(msg_id + "\n")
+    f.close()
+
+
+def is_already_in_gmail(imap, mailbox, clean_id):
+    folders = [mailbox, '"[Gmail]/Trash"', '"[Gmail]/휴지통"']
+    for folder in folders:
+        try:
+            typ, _ = imap.select(folder, readonly=True)
+            if typ == "OK":
+                q = f'(HEADER Message-ID "{clean_id}")'
+                typ, data = imap.search(None, q)
+                if typ == "OK" and data and data[0]:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def main():
+    synced_ids = load_synced_ids()
+
+    imap = imaplib.IMAP4_SSL(IMAP_HOST)
+    imap.login(IMAP_USER, IMAP_PASS)
+    mailbox = f'"{encode_imap_utf7(TARGET_LABEL)}"'
+    imap.create(mailbox)
+
+    pop = poplib.POP3(POP_HOST, POP_PORT, timeout=30)
+    pop.user(POP_USER)
+    pop.pass_(POP_PASS)
+
+    num_messages = len(pop.list()[1])
+    start_idx = max(1, num_messages - 40)
+
+    synced = 0
+    for i in range(start_idx, num_messages + 1):
+        resp, header_lines, _ = pop.top(i, 0)
+        header_bytes = b"\r\n".join(header_lines)
+        msg_header = email.message_from_bytes(header_bytes)
+        msg_id = msg_header.get("Message-ID", "").strip()
+
+        if msg_id:
+            clean_id = msg_id.replace('"', "").strip()
+        else:
+            clean_id = f"NO_ID_{i}"
+
+        if clean_id in synced_ids:
+            continue
+
+        if msg_id and is_already_in_gmail(imap, mailbox, clean_id):
+            save_synced_id(clean_id)
+            synced_ids.add(clean_id)
+            continue
+
+        resp, lines, octets = pop.retr(i)
+        raw_email = b"\r\n".join(lines)
+        full_msg = email.message_from_bytes(raw_email)
+
+        try:
+            dt = parsedate_to_datetime(full_msg.get("Date"))
+            date_param = imaplib.Time2Internaldate(dt.timestamp())
+        except Exception:
+            date_param = imaplib.Time2Internaldate(time.time())
+
+        imap.append(mailbox, "", date_param, raw_email)
+        save_synced_id(clean_id)
+        synced_ids.add(clean_id)
+        synced += 1
+
+    pop.quit()
+    imap.logout()
+    print(f"Sync complete. New messages copied: {synced}")
+
+
+if __name__ == "__main__":
+    main()
