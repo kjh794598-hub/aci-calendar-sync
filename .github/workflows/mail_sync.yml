@@ -5,6 +5,9 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -22,3 +25,13 @@ jobs:
           ACI_MAIL_PASSWORD: ${{ secrets.ACI_MAIL_PASSWORD }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python mail_sync.py
+
+      - name: Save Synced Mail IDs
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f synced_mails.txt ]; then
+            git add synced_mails.txt
+            git diff --staged --quiet || git commit -m "Update synced mails list"
+            git push
+          fi
