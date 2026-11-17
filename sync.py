@@ -95,7 +95,7 @@ def register_to_groupware(events):
         page = context.new_page()
 
         print("1. 회사 그룹웨어 로그인 중...")
-        page.goto("http://gw.acichemical.com/gw/sub/common/login/cmmLogin.do")
+        page.goto("http://gw.acichemical.com/gw/sub/common/login/cmmLogin.do", timeout=120000, wait_until="domcontentloaded")
         page.fill("#cmmLogin_userId", USER_ID)
         page.fill("input[type='password']", USER_PW)
         page.press("input[type='password']", "Enter")
