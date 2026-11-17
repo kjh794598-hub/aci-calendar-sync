@@ -55,8 +55,16 @@ def save_synced_id(msg_id):
     f.close()
 
 
+def connect_pop():
+    pop = poplib.POP3(POP_HOST, POP_PORT, timeout=120)
+    pop.user(POP_USER)
+    pop.pass_(POP_PASS)
+    return pop
+
+
 def is_already_in_gmail(imap, mailbox, clean_id):
-    folders = [mailbox, '"[Gmail]/Trash"', '"[Gmail]/휴지통"']
+    kr_trash = f'"{encode_imap_utf7("[Gmail]/휴지통")}"'
+    folders = [mailbox, '"[Gmail]/Trash"', kr_trash]
     for folder in folders:
         try:
             typ, _ = imap.select(folder, readonly=True)
@@ -78,50 +86,69 @@ def main():
     mailbox = f'"{encode_imap_utf7(TARGET_LABEL)}"'
     imap.create(mailbox)
 
-    pop = poplib.POP3(POP_HOST, POP_PORT, timeout=30)
-    pop.user(POP_USER)
-    pop.pass_(POP_PASS)
-
+    pop = connect_pop()
     num_messages = len(pop.list()[1])
     start_idx = max(1, num_messages - 40)
 
     synced = 0
     for i in range(start_idx, num_messages + 1):
-        resp, header_lines, _ = pop.top(i, 0)
-        header_bytes = b"\r\n".join(header_lines)
-        msg_header = email.message_from_bytes(header_bytes)
-        msg_id = msg_header.get("Message-ID", "").strip()
+        try:
+            try:
+                resp, header_lines, _ = pop.top(i, 0)
+            except Exception:
+                pop = connect_pop()
+                resp, header_lines, _ = pop.top(i, 0)
 
-        if msg_id:
-            clean_id = msg_id.replace('"', "").strip()
-        else:
-            clean_id = f"NO_ID_{i}"
+            header_bytes = b"\r\n".join(header_lines)
+            msg_header = email.message_from_bytes(header_bytes)
+            msg_id = msg_header.get("Message-ID", "").strip()
 
-        if clean_id in synced_ids:
-            continue
+            if msg_id:
+                clean_id = "".join(msg_id.split()).replace('"', "")
+            else:
+                clean_id = f"NO_ID_{i}"
 
-        if msg_id and is_already_in_gmail(imap, mailbox, clean_id):
+            if clean_id in synced_ids:
+                continue
+
+            if msg_id and is_already_in_gmail(imap, mailbox, clean_id):
+                save_synced_id(clean_id)
+                synced_ids.add(clean_id)
+                continue
+
+            try:
+                resp, lines, octets = pop.retr(i)
+            except Exception:
+                pop = connect_pop()
+                resp, lines, octets = pop.retr(i)
+
+            raw_email = b"\r\n".join(lines)
+            full_msg = email.message_from_bytes(raw_email)
+
+            try:
+                dt = parsedate_to_datetime(full_msg.get("Date"))
+                date_param = imaplib.Time2Internaldate(dt.timestamp())
+            except Exception:
+                date_param = imaplib.Time2Internaldate(time.time())
+
+            imap.append(mailbox, "", date_param, raw_email)
+            save_synced_id(clean_id)
+            synced_ids.add(clean_id)
+            synced += 1
+        except Exception as e:
+            print(f"Skipped {i}: {e}")
             save_synced_id(clean_id)
             synced_ids.add(clean_id)
             continue
 
-        resp, lines, octets = pop.retr(i)
-        raw_email = b"\r\n".join(lines)
-        full_msg = email.message_from_bytes(raw_email)
-
-        try:
-            dt = parsedate_to_datetime(full_msg.get("Date"))
-            date_param = imaplib.Time2Internaldate(dt.timestamp())
-        except Exception:
-            date_param = imaplib.Time2Internaldate(time.time())
-
-        imap.append(mailbox, "", date_param, raw_email)
-        save_synced_id(clean_id)
-        synced_ids.add(clean_id)
-        synced += 1
-
-    pop.quit()
-    imap.logout()
+    try:
+        pop.quit()
+    except Exception:
+        pass
+    try:
+        imap.logout()
+    except Exception:
+        pass
     print(f"Sync complete. New messages copied: {synced}")
 
 
