@@ -6,6 +6,10 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch: # 내가 원할 때 수동으로 즉시 실행하는 버튼 생성
 
+concurrency:
+  group: aci-repo-sync
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -36,6 +40,5 @@ jobs:
           git config --global user.email "bot@example.com"
           if [ -f synced_events.txt ]; then
             git add synced_events.txt
-            git diff --staged --quiet || git commit -m "Update synced events"
-            git push
+            git diff --staged --quiet || (git commit -m "Update synced events" && git pull --rebase origin main && git push)
           fi
