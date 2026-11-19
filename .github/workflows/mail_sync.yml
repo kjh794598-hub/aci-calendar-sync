@@ -1,17 +1,18 @@
-name: ACI Mail Sync
+name: Sync ACI Mail to Gmail
 
 on:
   workflow_dispatch:
-
-concurrency:
-  group: aci-repo-sync
-  cancel-in-progress: false
+    inputs:
+      send_draft:
+        description: 'Send latest draft immediately'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
 
 jobs:
-  sync:
+  mail-sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -22,10 +23,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run mail sync
+      - name: Run Mail Sync
         env:
           ACI_MAIL_PASSWORD: ${{ secrets.ACI_MAIL_PASSWORD }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          SEND_LATEST_DRAFT: ${{ github.event.inputs.send_draft || 'false' }}
         run: python mail_sync.py
 
       - name: Save synced mail log
@@ -33,8 +35,4 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add synced_mails.txt
-          if ! git diff --staged --quiet; then
-            git commit -m "Update synced_mails.txt"
-            git pull --rebase -X ours origin main
-            git push
-          fi
+          git diff --staged --quiet || (git commit -m "Update synced mails log" && git pull --rebase origin main && git push)
