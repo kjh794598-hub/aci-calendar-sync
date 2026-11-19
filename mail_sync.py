@@ -2,6 +2,7 @@ import poplib
 import imaplib
 import smtplib
 import email
+import email.policy
 from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid, formataddr
 from email.header import Header
 import os
@@ -87,6 +88,33 @@ def is_already_in_gmail(imap, mailbox, clean_id):
     return False
 
 
+def fix_text_parts_encoding(msg):
+    """Quoted-Printable로 인해 아웃룩 등에서 한글/태그가 깨지는 현상을 방지하기 위해
+    모든 텍스트(plain/html) 파트를 깨끗하게 디코딩한 뒤 Base64(UTF-8)로 재포장합니다."""
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type()
+        if ctype in ("text/plain", "text/html"):
+            payload_bytes = part.get_payload(decode=True)
+            if payload_bytes is None:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload_bytes.decode(charset, errors="replace")
+            except Exception:
+                text = payload_bytes.decode("utf-8", errors="replace")
+
+            utf8_bytes = text.encode("utf-8")
+            b64_str = base64.encodebytes(utf8_bytes).decode("ascii")
+
+            part.set_payload(b64_str)
+            if "Content-Transfer-Encoding" in part:
+                del part["Content-Transfer-Encoding"]
+            part["Content-Transfer-Encoding"] = "base64"
+            part.set_param("charset", "utf-8", header="Content-Type")
+
+
 def transmit_and_cleanup_draft(imap, current_folder, num):
     sent_folders = [
         f'"{encode_imap_utf7("[Gmail]/보낸편지함")}"',
@@ -139,7 +167,9 @@ def transmit_and_cleanup_draft(imap, current_folder, num):
         if h.lower().startswith("x-gm-") or h.lower().startswith("x-google-"):
             del msg[h]
 
-    out_bytes = msg.as_bytes()
+    # 한글 및 HTML 태그 깨짐 방지(Base64 재인코딩) 및 표준 CRLF(\r\n) 줄바꿈 적용
+    fix_text_parts_encoding(msg)
+    out_bytes = msg.as_bytes(policy=email.policy.SMTP)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
         smtp.ehlo()
