@@ -1,12 +1,11 @@
 name: ACI Mail Sync
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
+concurrency:
+  group: aci-mail-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -20,18 +19,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run Mail Sync
+      - name: Run mail sync
         env:
           ACI_MAIL_PASSWORD: ${{ secrets.ACI_MAIL_PASSWORD }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python mail_sync.py
 
-      - name: Save Synced Mail IDs
+      - name: Save synced mail log
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -f synced_mails.txt ]; then
-            git add synced_mails.txt
-            git diff --staged --quiet || git commit -m "Update synced mails list"
-            git push
-          fi
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add synced_mails.txt
+          git diff --quiet && git diff --staged --quiet || (git pull --rebase origin main && git commit -m "Update synced_mails.txt" && git push)
