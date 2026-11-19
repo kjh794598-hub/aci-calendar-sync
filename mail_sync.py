@@ -1,13 +1,16 @@
 import poplib
 import imaplib
+import smtplib
 import email
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid
 import os
 import time
 import base64
 
 POP_HOST = "gwmail.acichemical.com"
 POP_PORT = 110
+SMTP_HOST = "gwmail.acichemical.com"
+SMTP_PORT = 425
 POP_USER = "alex.kim@acichemical.com"
 POP_PASS = os.environ["ACI_MAIL_PASSWORD"]
 
@@ -15,6 +18,7 @@ IMAP_HOST = "imap.gmail.com"
 IMAP_USER = "kjh794598@gmail.com"
 IMAP_PASS = os.environ["GMAIL_APP_PASSWORD"]
 TARGET_LABEL = "[ACI 업무]"
+OUTBOX_LABEL = "[회사발송]"
 SYNC_LOG_FILE = "synced_mails.txt"
 
 
@@ -43,23 +47,26 @@ def encode_imap_utf7(s):
 def load_synced_ids():
     if not os.path.exists(SYNC_LOG_FILE):
         return set()
-    f = open(SYNC_LOG_FILE, "r", encoding="utf-8")
-    data = set(line.strip() for line in f if line.strip())
-    f.close()
-    return data
+    with open(SYNC_LOG_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f if line.strip())
 
 
 def save_synced_id(msg_id):
-    f = open(SYNC_LOG_FILE, "a", encoding="utf-8")
-    f.write(msg_id + "\n")
-    f.close()
+    with open(SYNC_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(msg_id + "\n")
 
 
 def connect_pop():
-    pop = poplib.POP3(POP_HOST, POP_PORT, timeout=120)
-    pop.user(POP_USER)
-    pop.pass_(POP_PASS)
-    return pop
+    for attempt in range(3):
+        try:
+            pop = poplib.POP3(POP_HOST, POP_PORT, timeout=25)
+            pop.user(POP_USER)
+            pop.pass_(POP_PASS)
+            return pop
+        except Exception as e:
+            print(f"POP3 connection attempt {attempt + 1} failed: {e}")
+            time.sleep(3)
+    return None
 
 
 def is_already_in_gmail(imap, mailbox, clean_id):
@@ -78,25 +85,139 @@ def is_already_in_gmail(imap, mailbox, clean_id):
     return False
 
 
+def send_outbox_drafts(imap):
+    outbox_folder = f'"{encode_imap_utf7(OUTBOX_LABEL)}"'
+    try:
+        typ, _ = imap.select(outbox_folder, readonly=False)
+        if typ != "OK":
+            return
+    except Exception:
+        return
+
+    try:
+        typ, data = imap.search(None, "ALL")
+        if typ != "OK" or not data or not data[0]:
+            return
+        msg_nums = data[0].split()
+    except Exception as e:
+        print(f"Outbox search error: {e}")
+        return
+
+    sent_folders = [
+        f'"{encode_imap_utf7("[Gmail]/보낸편지함")}"',
+        '"[Gmail]/Sent Mail"',
+    ]
+
+    for num in msg_nums:
+        try:
+            typ, full_data = imap.fetch(num, "(BODY.PEEK[])")
+            if typ != "OK" or not full_data or not full_data[0]:
+                continue
+            raw_email = full_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            tos = msg.get_all("To", [])
+            ccs = msg.get_all("Cc", [])
+            bccs = msg.get_all("Bcc", [])
+            recipients = [
+                addr for name, addr in getaddresses(tos + ccs + bccs) if addr
+            ]
+
+            if not recipients:
+                print("Draft has no recipients, skipping.")
+                continue
+
+            if "From" in msg:
+                msg.replace_header("From", f"김정호 <{POP_USER}>")
+            else:
+                msg["From"] = f"김정호 <{POP_USER}>"
+
+            if "Date" in msg:
+                msg.replace_header("Date", formatdate(localtime=True))
+            else:
+                msg["Date"] = formatdate(localtime=True)
+
+            if not msg.get("Message-ID"):
+                msg["Message-ID"] = make_msgid(domain="acichemical.com")
+
+            if "Bcc" in msg:
+                del msg["Bcc"]
+
+            out_bytes = msg.as_bytes()
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
+                smtp.ehlo()
+                try:
+                    smtp.starttls()
+                    smtp.ehlo()
+                except Exception:
+                    pass
+                smtp.login(POP_USER, POP_PASS)
+                smtp.sendmail(POP_USER, recipients, out_bytes)
+
+            print(f"Sent draft via company SMTP (port 425) to: {recipients}")
+
+            imap.store(num, "+FLAGS", "\\Deleted")
+
+            date_param = imaplib.Time2Internaldate(time.time())
+            for sf in sent_folders:
+                try:
+                    res, _ = imap.append(sf, "\\Seen", date_param, out_bytes)
+                    if res == "OK":
+                        break
+                except Exception:
+                    continue
+
+        except Exception as e:
+            print(f"Failed to send outbox draft {num}: {e}")
+            continue
+
+    try:
+        imap.expunge()
+    except Exception:
+        pass
+
+
 def main():
     synced_ids = load_synced_ids()
 
-    imap = imaplib.IMAP4_SSL(IMAP_HOST)
+    imap = imaplib.IMAP4_SSL(IMAP_HOST, timeout=30)
     imap.login(IMAP_USER, IMAP_PASS)
     mailbox = f'"{encode_imap_utf7(TARGET_LABEL)}"'
     imap.create(mailbox)
 
-    pop = connect_pop()
-    num_messages = len(pop.list()[1])
-    start_idx = max(1, num_messages - 40)
+    send_outbox_drafts(imap)
 
+    pop = connect_pop()
+    if not pop:
+        print("POP3 server temporarily unreachable. Will retry on next schedule.")
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        return
+
+    try:
+        num_messages = len(pop.list()[1])
+    except Exception as e:
+        print(f"Failed to list messages: {e}")
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        return
+
+    start_idx = max(1, num_messages - 40)
     synced = 0
+
     for i in range(start_idx, num_messages + 1):
         try:
             try:
                 resp, header_lines, _ = pop.top(i, 0)
             except Exception:
                 pop = connect_pop()
+                if not pop:
+                    break
                 resp, header_lines, _ = pop.top(i, 0)
 
             header_bytes = b"\r\n".join(header_lines)
@@ -120,6 +241,8 @@ def main():
                 resp, lines, octets = pop.retr(i)
             except Exception:
                 pop = connect_pop()
+                if not pop:
+                    break
                 resp, lines, octets = pop.retr(i)
 
             raw_email = b"\r\n".join(lines)
@@ -137,12 +260,11 @@ def main():
             synced += 1
         except Exception as e:
             print(f"Skipped {i}: {e}")
-            save_synced_id(clean_id)
-            synced_ids.add(clean_id)
             continue
 
     try:
-        pop.quit()
+        if pop:
+            pop.quit()
     except Exception:
         pass
     try:
