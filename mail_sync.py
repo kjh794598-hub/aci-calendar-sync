@@ -2,7 +2,8 @@ import poplib
 import imaplib
 import smtplib
 import email
-from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid
+from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid, formataddr
+from email.header import Header
 import os
 import time
 import base64
@@ -107,6 +108,14 @@ def send_outbox_drafts(imap):
         f'"{encode_imap_utf7("[Gmail]/보낸편지함")}"',
         '"[Gmail]/Sent Mail"',
     ]
+    trash_folders = [
+        f'"{encode_imap_utf7("[Gmail]/휴지통")}"',
+        '"[Gmail]/Trash"',
+    ]
+    draft_folders = [
+        f'"{encode_imap_utf7("[Gmail]/임시보관함")}"',
+        '"[Gmail]/Drafts"',
+    ]
 
     for num in msg_nums:
         try:
@@ -115,6 +124,7 @@ def send_outbox_drafts(imap):
                 continue
             raw_email = full_data[0][1]
             msg = email.message_from_bytes(raw_email)
+            orig_msg_id = msg.get("Message-ID", "").strip()
 
             tos = msg.get_all("To", [])
             ccs = msg.get_all("Cc", [])
@@ -127,21 +137,25 @@ def send_outbox_drafts(imap):
                 print("Draft has no recipients, skipping.")
                 continue
 
-            if "From" in msg:
-                msg.replace_header("From", f"김정호 <{POP_USER}>")
-            else:
-                msg["From"] = f"김정호 <{POP_USER}>"
+            encoded_from = formataddr((Header("김정호", "utf-8").encode(), POP_USER))
+            while "From" in msg:
+                del msg["From"]
+            msg["From"] = encoded_from
 
-            if "Date" in msg:
-                msg.replace_header("Date", formatdate(localtime=True))
-            else:
-                msg["Date"] = formatdate(localtime=True)
+            while "Date" in msg:
+                del msg["Date"]
+            msg["Date"] = formatdate(localtime=True)
 
-            if not msg.get("Message-ID"):
-                msg["Message-ID"] = make_msgid(domain="acichemical.com")
+            while "Message-ID" in msg:
+                del msg["Message-ID"]
+            msg["Message-ID"] = make_msgid(domain="acichemical.com")
 
             if "Bcc" in msg:
                 del msg["Bcc"]
+
+            for h in list(msg.keys()):
+                if h.lower().startswith("x-gm-") or h.lower().startswith("x-google-"):
+                    del msg[h]
 
             out_bytes = msg.as_bytes()
 
@@ -157,8 +171,17 @@ def send_outbox_drafts(imap):
 
             print(f"Sent draft via company SMTP (port 425) to: {recipients}")
 
+            # 1) [회사발송] 폴더에서 휴지통으로 복사 후 삭제
+            for tf in trash_folders:
+                try:
+                    res, _ = imap.copy(num, tf)
+                    if res == "OK":
+                        break
+                except Exception:
+                    continue
             imap.store(num, "+FLAGS", "\\Deleted")
 
+            # 2) 보낸편지함에 저장
             date_param = imaplib.Time2Internaldate(time.time())
             for sf in sent_folders:
                 try:
@@ -167,6 +190,30 @@ def send_outbox_drafts(imap):
                         break
                 except Exception:
                     continue
+
+            # 3) [임시보관함]에 남아있는 원본도 찾아서 완전히 삭제
+            if orig_msg_id:
+                clean_orig_id = "".join(orig_msg_id.split()).replace('"', "")
+                for df in draft_folders:
+                    try:
+                        t_sel, _ = imap.select(df, readonly=False)
+                        if t_sel == "OK":
+                            t_srch, d_srch = imap.search(
+                                None, f'(HEADER Message-ID "{clean_orig_id}")'
+                            )
+                            if t_srch == "OK" and d_srch and d_srch[0]:
+                                for d_num in d_srch[0].split():
+                                    for tf in trash_folders:
+                                        try:
+                                            imap.copy(d_num, tf)
+                                        except Exception:
+                                            pass
+                                    imap.store(d_num, "+FLAGS", "\\Deleted")
+                                imap.expunge()
+                            break
+                    except Exception:
+                        continue
+                imap.select(outbox_folder, readonly=False)
 
         except Exception as e:
             print(f"Failed to send outbox draft {num}: {e}")
