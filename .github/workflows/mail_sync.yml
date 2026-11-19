@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: aci-mail-sync
+  group: aci-repo-sync
   cancel-in-progress: false
 
 jobs:
@@ -30,4 +30,4 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add synced_mails.txt
-          git diff --quiet && git diff --staged --quiet || (git pull --rebase origin main && git commit -m "Update synced_mails.txt" && git push)
+          git diff --staged --quiet || (git commit -m "Update synced_mails.txt" && git pull --rebase origin main && git push)
