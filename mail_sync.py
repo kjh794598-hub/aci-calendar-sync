@@ -8,6 +8,7 @@ from email.header import Header
 import os
 import time
 import base64
+import uuid
 
 POP_HOST = "gwmail.acichemical.com"
 POP_PORT = 110
@@ -88,12 +89,17 @@ def is_already_in_gmail(imap, mailbox, clean_id):
     return False
 
 
-def fix_text_parts_encoding(msg):
-    """Quoted-Printable로 인해 아웃룩 등에서 한글/태그가 깨지는 현상을 방지하기 위해
-    모든 텍스트(plain/html) 파트를 깨끗하게 디코딩한 뒤 Base64(UTF-8)로 재포장합니다."""
+def sanitize_and_fix_encoding(msg):
+    """1. Gmail 특유의 MIME boundary 흔적을 아웃룩 스타일로 세탁하여 스팸 분류 방지
+    2. Quoted-Printable로 인한 한글/HTML 깨짐 방지를 위해 Base64(UTF-8)로 재포장"""
     for part in msg.walk():
         if part.is_multipart():
+            old_boundary = part.get_boundary()
+            if old_boundary:
+                new_boundary = f"----=_NextPart_{uuid.uuid4().hex[:16].upper()}"
+                part.set_boundary(new_boundary)
             continue
+
         ctype = part.get_content_type()
         if ctype in ("text/plain", "text/html"):
             payload_bytes = part.get_payload(decode=True)
@@ -148,34 +154,36 @@ def transmit_and_cleanup_draft(imap, current_folder, num):
         return False
 
     encoded_from = formataddr((Header("김정호", "utf-8").encode(), POP_USER))
-    while "From" in msg:
-        del msg["From"]
+    for hdr in ("From", "Reply-To", "Return-Path", "Sender", "Date", "Message-ID", "Bcc", "X-Mailer"):
+        while hdr in msg:
+            del msg[hdr]
+
     msg["From"] = encoded_from
-
-    while "Date" in msg:
-        del msg["Date"]
+    msg["Reply-To"] = encoded_from
     msg["Date"] = formatdate(localtime=True)
-
-    while "Message-ID" in msg:
-        del msg["Message-ID"]
     msg["Message-ID"] = make_msgid(domain="acichemical.com")
-
-    if "Bcc" in msg:
-        del msg["Bcc"]
+    msg["X-Mailer"] = "Microsoft Outlook 16.0"
 
     for h in list(msg.keys()):
-        if h.lower().startswith("x-gm-") or h.lower().startswith("x-google-"):
+        hl = h.lower()
+        if (
+            hl.startswith("x-gm-")
+            or hl.startswith("x-google-")
+            or hl.startswith("dkim-")
+            or hl.startswith("arc-")
+            or hl == "received"
+        ):
             del msg[h]
 
-    # 한글 및 HTML 태그 깨짐 방지(Base64 재인코딩) 및 표준 CRLF(\r\n) 줄바꿈 적용
-    fix_text_parts_encoding(msg)
+    # 스팸 방지용 MIME 경계선 세탁 + 한글/HTML 깨짐 방지(Base64) + 표준 CRLF 줄바꿈 적용
+    sanitize_and_fix_encoding(msg)
     out_bytes = msg.as_bytes(policy=email.policy.SMTP)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
-        smtp.ehlo()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, local_hostname="acichemical.com", timeout=30) as smtp:
+        smtp.ehlo("acichemical.com")
         try:
             smtp.starttls()
-            smtp.ehlo()
+            smtp.ehlo("acichemical.com")
         except Exception:
             pass
         smtp.login(POP_USER, POP_PASS)
