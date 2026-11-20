@@ -73,6 +73,61 @@ def connect_pop():
     return None
 
 
+def mark_read_on_company_server(synced_message_ids):
+    """Gmail로 넘어간 메일들을 회사 메일 서버(웹메일/IMAP 아웃룩)에서도 자동으로 '읽음(\\Seen)' 상태로 변경"""
+    if not synced_message_ids:
+        return
+
+    corp_imap = None
+    for port, use_ssl in ((993, True), (143, False)):
+        try:
+            if use_ssl:
+                corp_imap = imaplib.IMAP4_SSL(POP_HOST, port, timeout=15)
+            else:
+                corp_imap = imaplib.IMAP4(POP_HOST, port, timeout=15)
+            corp_imap.login(POP_USER, POP_PASS)
+            break
+        except Exception:
+            corp_imap = None
+
+    if not corp_imap:
+        try:
+            # 회사 서버가 IMAP을 지원하지 않는 경우 최근 안 읽은 메일 일괄 확인 처리 불가 안내
+            print("Company IMAP port not open; skipping server-side Seen flag.")
+        except Exception:
+            pass
+        return
+
+    try:
+        typ, _ = corp_imap.select("INBOX", readonly=False)
+        if typ == "OK":
+            for mid in synced_message_ids:
+                if mid.startswith("NO_ID_"):
+                    continue
+                try:
+                    t_srch, d_srch = corp_imap.search(None, f'(HEADER Message-ID "{mid}")')
+                    if t_srch == "OK" and d_srch and d_srch[0]:
+                        for num in d_srch[0].split():
+                            corp_imap.store(num, "+FLAGS", "\\Seen")
+                except Exception:
+                    continue
+            # 혹시 ID 매칭이 안 된 최근 수신 메일도 안 읽음(UNSEEN) 상태면 읽음 처리
+            try:
+                t_unseen, d_unseen = corp_imap.search(None, "UNSEEN")
+                if t_unseen == "OK" and d_unseen and d_unseen[0]:
+                    for num in d_unseen[0].split()[-40:]:
+                        corp_imap.store(num, "+FLAGS", "\\Seen")
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Company IMAP mark-read warning: {e}")
+    finally:
+        try:
+            corp_imap.logout()
+        except Exception:
+            pass
+
+
 def is_already_in_gmail(imap, mailbox, clean_id):
     kr_trash = f'"{encode_imap_utf7("[Gmail]/휴지통")}"'
     folders = [mailbox, '"[Gmail]/Trash"', kr_trash]
@@ -90,8 +145,6 @@ def is_already_in_gmail(imap, mailbox, clean_id):
 
 
 def sanitize_and_fix_encoding(msg):
-    """1. Gmail 특유의 MIME boundary 흔적을 아웃룩 스타일로 세탁하여 스팸 분류 방지
-    2. Quoted-Printable로 인한 한글/HTML 깨짐 방지를 위해 Base64(UTF-8)로 재포장"""
     for part in msg.walk():
         if part.is_multipart():
             old_boundary = part.get_boundary()
@@ -175,7 +228,6 @@ def transmit_and_cleanup_draft(imap, current_folder, num):
         ):
             del msg[h]
 
-    # 스팸 방지용 MIME 경계선 세탁 + 한글/HTML 깨짐 방지(Base64) + 표준 CRLF 줄바꿈 적용
     sanitize_and_fix_encoding(msg)
     out_bytes = msg.as_bytes(policy=email.policy.SMTP)
 
@@ -306,6 +358,7 @@ def main():
 
     start_idx = max(1, num_messages - 40)
     synced = 0
+    newly_synced_ids = []
 
     for i in range(start_idx, num_messages + 1):
         try:
@@ -332,6 +385,7 @@ def main():
             if msg_id and is_already_in_gmail(imap, mailbox, clean_id):
                 save_synced_id(clean_id)
                 synced_ids.add(clean_id)
+                newly_synced_ids.append(clean_id)
                 continue
 
             try:
@@ -354,6 +408,7 @@ def main():
             imap.append(mailbox, "", date_param, raw_email)
             save_synced_id(clean_id)
             synced_ids.add(clean_id)
+            newly_synced_ids.append(clean_id)
             synced += 1
         except Exception as e:
             print(f"Skipped {i}: {e}")
@@ -368,6 +423,10 @@ def main():
         imap.logout()
     except Exception:
         pass
+
+    # Gmail로 넘어간 최근 메일들을 회사 서버(웹메일/아웃룩)에서도 '읽음' 상태로 전환
+    mark_read_on_company_server(newly_synced_ids or list(synced_ids)[-20:])
+
     print(f"Sync complete. New messages copied: {synced}")
 
 
