@@ -4,7 +4,7 @@ import smtplib
 import email
 import email.policy
 from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid, formataddr
-from email.header import Header
+from email.header import Header, decode_header
 import os
 import time
 import base64
@@ -92,7 +92,6 @@ def mark_read_on_company_server(synced_message_ids):
 
     if not corp_imap:
         try:
-            # 회사 서버가 IMAP을 지원하지 않는 경우 최근 안 읽은 메일 일괄 확인 처리 불가 안내
             print("Company IMAP port not open; skipping server-side Seen flag.")
         except Exception:
             pass
@@ -111,7 +110,6 @@ def mark_read_on_company_server(synced_message_ids):
                             corp_imap.store(num, "+FLAGS", "\\Seen")
                 except Exception:
                     continue
-            # 혹시 ID 매칭이 안 된 최근 수신 메일도 안 읽음(UNSEEN) 상태면 읽음 처리
             try:
                 t_unseen, d_unseen = corp_imap.search(None, "UNSEEN")
                 if t_unseen == "OK" and d_unseen and d_unseen[0]:
@@ -144,6 +142,22 @@ def is_already_in_gmail(imap, mailbox, clean_id):
     return False
 
 
+def decode_mime_filename(raw_name):
+    if not raw_name:
+        return None
+    try:
+        parts = decode_header(raw_name)
+        decoded = []
+        for content, charset in parts:
+            if isinstance(content, bytes):
+                decoded.append(content.decode(charset or "utf-8", errors="replace"))
+            else:
+                decoded.append(str(content))
+        return "".join(decoded).replace("\r", "").replace("\n", "").strip()
+    except Exception:
+        return str(raw_name).replace("\r", "").replace("\n", "").strip()
+
+
 def sanitize_and_fix_encoding(msg):
     for part in msg.walk():
         if part.is_multipart():
@@ -154,7 +168,30 @@ def sanitize_and_fix_encoding(msg):
             continue
 
         ctype = part.get_content_type()
-        if ctype in ("text/plain", "text/html"):
+
+        # 구형 Apache James 서버의 'Expected MIME subtype, got =' 에러 방지:
+        # 첨부파일의 Content-Type 헤더에서 name/name* 파라미터를 제거하고,
+        # Content-Disposition에만 한 줄짜리 표준 Base64 파일명으로 고정
+        raw_filename = part.get_filename()
+        if raw_filename:
+            clean_name = decode_mime_filename(raw_filename)
+            if "Content-Type" in part:
+                del part["Content-Type"]
+            part["Content-Type"] = ctype
+
+            disp_type = part.get_content_disposition() or "attachment"
+            if "Content-Disposition" in part:
+                del part["Content-Disposition"]
+
+            try:
+                clean_name.encode("ascii")
+                safe_name = clean_name.replace('"', "")
+                part["Content-Disposition"] = f'{disp_type}; filename="{safe_name}"'
+            except UnicodeEncodeError:
+                b64_name = base64.b64encode(clean_name.encode("utf-8")).decode("ascii")
+                part["Content-Disposition"] = f'{disp_type}; filename="=?utf-8?B?{b64_name}?="'
+
+        if ctype in ("text/plain", "text/html") and not raw_filename:
             payload_bytes = part.get_payload(decode=True)
             if payload_bytes is None:
                 continue
@@ -171,7 +208,9 @@ def sanitize_and_fix_encoding(msg):
             if "Content-Transfer-Encoding" in part:
                 del part["Content-Transfer-Encoding"]
             part["Content-Transfer-Encoding"] = "base64"
-            part.set_param("charset", "utf-8", header="Content-Type")
+            if "Content-Type" in part:
+                del part["Content-Type"]
+            part["Content-Type"] = f'{ctype}; charset="utf-8"'
 
 
 def transmit_and_cleanup_draft(imap, current_folder, num):
@@ -229,7 +268,7 @@ def transmit_and_cleanup_draft(imap, current_folder, num):
             del msg[h]
 
     sanitize_and_fix_encoding(msg)
-    out_bytes = msg.as_bytes(policy=email.policy.SMTP)
+    out_bytes = msg.as_bytes(policy=email.policy.SMTP.clone(max_line_length=1000))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, local_hostname="acichemical.com", timeout=30) as smtp:
         smtp.ehlo("acichemical.com")
@@ -424,7 +463,6 @@ def main():
     except Exception:
         pass
 
-    # Gmail로 넘어간 최근 메일들을 회사 서버(웹메일/아웃룩)에서도 '읽음' 상태로 전환
     mark_read_on_company_server(newly_synced_ids or list(synced_ids)[-20:])
 
     print(f"Sync complete. New messages copied: {synced}")
