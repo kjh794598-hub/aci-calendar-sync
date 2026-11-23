@@ -5,10 +5,14 @@ import email
 import email.policy
 from email.utils import parsedate_to_datetime, getaddresses, formatdate, make_msgid, formataddr
 from email.header import Header, decode_header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import os
+import re
 import time
 import base64
 import uuid
+import copy
 
 POP_HOST = "gwmail.acichemical.com"
 POP_PORT = 110
@@ -158,6 +162,107 @@ def decode_mime_filename(raw_name):
         return str(raw_name).replace("\r", "").replace("\n", "").strip()
 
 
+def attach_original_files_if_requested(imap, current_folder, msg):
+    """본문에 [ORIG_MSG_ID: ...] 또는 [FWD_FROM_ID: ...] 태그가 있으면 원본 메일의 첨부파일을 자동으로 가져와 합침"""
+    marker_pattern = re.compile(r"\[(?:ORIG_MSG_ID|FWD_FROM_ID):\s*([^\]]+)\]")
+    target_ref = None
+
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_type() in ("text/plain", "text/html") and not part.get_filename():
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="replace")
+            except Exception:
+                text = payload.decode("utf-8", errors="replace")
+
+            m = marker_pattern.search(text)
+            if m:
+                if not target_ref:
+                    target_ref = m.group(1).strip()
+                cleaned_text = marker_pattern.sub("", text).rstrip()
+                part.set_payload(cleaned_text.encode("utf-8"))
+                part.set_param("charset", "utf-8", header="Content-Type")
+
+    if not target_ref:
+        return msg
+
+    clean_ref = target_ref.strip().strip("<>").replace('"', "")
+    search_folders = [
+        f'"{encode_imap_utf7(TARGET_LABEL)}"',
+        "INBOX",
+        f'"{encode_imap_utf7("[Gmail]/전체보관함")}"',
+        '"[Gmail]/All Mail"',
+        f'"{encode_imap_utf7("[Gmail]/보낸편지함")}"',
+        '"[Gmail]/Sent Mail"',
+    ]
+
+    orig_msg = None
+    for sf in search_folders:
+        try:
+            typ, _ = imap.select(sf, readonly=True)
+            if typ != "OK":
+                continue
+
+            # 1) RFC822 Message-ID 헤더로 검색
+            t_srch, d_srch = imap.search(None, f'(HEADER Message-ID "{clean_ref}")')
+            # 2) 만약 Gmail 16자리 16진수 ID인 경우 X-GM-MSGID로 변환 검색
+            if (t_srch != "OK" or not d_srch or not d_srch[0]) and re.fullmatch(r"[0-9a-fA-F]{15,16}", clean_ref):
+                gm_dec = str(int(clean_ref, 16))
+                t_srch, d_srch = imap.search(None, f"X-GM-MSGID {gm_dec}")
+
+            if t_srch == "OK" and d_srch and d_srch[0]:
+                target_num = d_srch[0].split()[-1]
+                t_fet, d_fet = imap.fetch(target_num, "(BODY.PEEK[])")
+                if t_fet == "OK" and d_fet and d_fet[0]:
+                    orig_msg = email.message_from_bytes(d_fet[0][1])
+                    break
+        except Exception:
+            continue
+
+    try:
+        imap.select(current_folder, readonly=False)
+    except Exception:
+        pass
+
+    if not orig_msg:
+        print(f"Original message not found for attachment copy: {clean_ref}")
+        return msg
+
+    attachments = []
+    for part in orig_msg.walk():
+        if part.is_multipart():
+            continue
+        if part.get_filename() or part.get_content_disposition() == "attachment":
+            attachments.append(copy.deepcopy(part))
+
+    if not attachments:
+        return msg
+
+    if not msg.is_multipart() or msg.get_content_type() == "multipart/alternative":
+        new_msg = MIMEMultipart("mixed")
+        for k, v in msg.items():
+            if k.lower() not in ("content-type", "content-transfer-encoding", "mime-version"):
+                new_msg[k] = v
+
+        body_copy = copy.deepcopy(msg)
+        for k in list(body_copy.keys()):
+            if k.lower() not in ("content-type", "content-transfer-encoding"):
+                del body_copy[k]
+        new_msg.attach(body_copy)
+        msg = new_msg
+
+    for att in attachments:
+        msg.attach(att)
+
+    print(f"Attached {len(attachments)} file(s) from original message {clean_ref}")
+    return msg
+
+
 def sanitize_and_fix_encoding(msg):
     for part in msg.walk():
         if part.is_multipart():
@@ -169,9 +274,6 @@ def sanitize_and_fix_encoding(msg):
 
         ctype = part.get_content_type()
 
-        # 구형 Apache James 서버의 'Expected MIME subtype, got =' 에러 방지:
-        # 첨부파일의 Content-Type 헤더에서 name/name* 파라미터를 제거하고,
-        # Content-Disposition에만 한 줄짜리 표준 Base64 파일명으로 고정
         raw_filename = part.get_filename()
         if raw_filename:
             clean_name = decode_mime_filename(raw_filename)
@@ -244,6 +346,9 @@ def transmit_and_cleanup_draft(imap, current_folder, num):
     if not recipients:
         print("Draft has no recipients, skipping.")
         return False
+
+    # 운전 중 전달 요청 시 원본 메일 첨부파일 자동 병합
+    msg = attach_original_files_if_requested(imap, current_folder, msg)
 
     encoded_from = formataddr((Header("김정호", "utf-8").encode(), POP_USER))
     for hdr in ("From", "Reply-To", "Return-Path", "Sender", "Date", "Message-ID", "Bcc", "X-Mailer"):
